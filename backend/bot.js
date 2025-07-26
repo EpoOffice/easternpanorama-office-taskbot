@@ -20,15 +20,12 @@ const ROLES = {
 
 
 
-
-
 // ========== 1. Helper: Check if current user is the Boss ==========
 // Checks if the current ctx is from the Boss by comparing chatId to ROLES.boss
 function isBoss(ctx) {
     const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
     return chatId === ROLES.boss;
 }
-
 
 
 // ========== 2. Show Tasks by Status for Doers ==========
@@ -90,33 +87,410 @@ async function showTasksByStatus(ctx, status) {
 // /register: Allows a user to register their Telegram ID if their name exists in the Doer table
 // If already registered, notifies user. If not found in DB, asks to contact admin.
 // doer will register themselves and all the register user will save to the doers table which can be shown to boss to assign task
+// Session object for multi-step registration
+let registrationSession = {};
 bot.command('register', async (ctx) => {
-    console.log("register is called");
-    const telegramId = ctx.chat.id;
+    const chatId = getChatId(ctx);
+    const telegramId = chatId;
     const fullName = `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim().toUpperCase();
 
+    // Reset session for fresh registration
+    registrationSession[chatId] = {};
 
     try {
-        const doer = await Doer.findOne({
-            where: { name: fullName }
+        let doer = await Doer.findOne({ where: { telegramId } });
+
+        if (doer) {
+            if (doer.approvalStatus === 'PENDING') {
+                delete registrationSession[chatId];
+                return ctx.reply("🕒 Your registration is pending MIS approval. Please wait or contact MIS");
+            }
+
+            if (doer && doer.approvalStatus === 'REJECTED') {
+                await ctx.reply("❌ Your registration was rejected. Please contact MIS or re-register with correct details.");
+            }
+
+            // Already registered
+            registrationSession[chatId] = {
+                doerId: doer.id,
+                step: 'already_registered',
+                name: doer.name,
+                department: doer.department
+            };
+
+            // Already has department?
+            if (doer.department) {
+                await ctx.reply(`✅ You are already registered as *${doer.name}* in *${doer.department}* department.\n\nDo you want to change your department?`, {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback('Yes', 'REG_CHANGE_DEPT')],
+                        [Markup.button.callback('No', 'REG_CANCEL')]
+                    ])
+                });
+            } else {
+                registrationSession[chatId].step = 'choose_department_update';
+                // Missing department—let them set it
+                showDepartmentOptions(ctx, 'Please select your department to update:', 'REG_SELECT_DEPT_UPDATE');
+            }
+            //  Stop here — don't go to fallback name check
+            return;
+        }
+
+        const firstNameOnly = ctx.from.first_name.trim().toUpperCase().split(' ')[0];
+        // If no doer exists with this Telegram ID → check by name (maybe unlinked doer exists)
+        doer = await Doer.findOne({
+            where: {
+                [Op.or]: [
+                    { name: fullName },
+                    { name: firstNameOnly }
+                ],
+                telegramId: null
+            }
         });
 
-        if (!doer) {
-            ctx.reply(`❌ Your name "${fullName}" is not found in the system. Please contact admin to add you.`);
-        } else if (doer.telegramId) {
-            ctx.reply("✅ You are already registered.");
+        if (doer) {
+            // Doer exists in DB by name but not yet registered
+            registrationSession[chatId] = { doerId: doer.id, step: 'choose_department', name: doer.name };
+
+            if (doer.department) {
+                doer.telegramId = telegramId;
+                await doer.save();
+                ctx.reply(`✅ ${doer.name}, you are now registered with Telegram ID and department: *${doer.department}*.`, {
+                    parse_mode: 'Markdown'
+                });
+                delete registrationSession[chatId];
+            } else {
+                showDepartmentOptions(ctx, 'Please select your department:', 'REG_SELECT_DEPT');
+            }
         } else {
-            doer.telegramId = telegramId;
-            await doer.save();
-            ctx.reply(`✅ ${fullName}, you are now registered with Telegram ID.`);
+            // Not found in DB at all
+            registrationSession[chatId] = { step: 'not_in_table', fullName };
+            ctx.reply(`❌ Your name "${fullName}" is not found in the system. Do you want to register yourself?`, {
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('Yes', 'REG_SELF_ADD')],
+                    [Markup.button.callback('No', 'REG_CANCEL')]
+                ])
+            });
         }
+
     } catch (error) {
         console.error("❌ Register error:", error);
         ctx.reply("⚠️ Registration failed. Please try again or contact support.");
+        delete registrationSession[chatId];
     }
 });
 
+// Helper to show department options as buttons
+function showDepartmentOptions(ctx, prompt, prefix = 'REG_SELECT_DEPT') {
+    console.log("prefix: ", prefix);
+    // You can get from Doer model or hardcode for now:
+    const departments = [
+        "Accounts", "Admin", "CRM", "Designer", "EA", "Foundation", "HR",
+        "MIS", "Office Assistant", "Process Coordinator", "Receptionist",
+        "Sales dept", "Tender Executive"
+    ];
+    const buttons = departments.map(dep => [Markup.button.callback(dep, `${prefix}_${dep}`)]);
+    return ctx.reply(prompt, Markup.inlineKeyboard(buttons));
+}
+// 1. If already registered and wants to change department
+bot.action('REG_CHANGE_DEPT', (ctx) => {
+    const chatId = getChatId(ctx);
+    if (!registrationSession[chatId] || !registrationSession[chatId].doerId) return ctx.reply("Session expired. Please use /register again.");
+    registrationSession[chatId].step = 'choose_department_update';
+    showDepartmentOptions(ctx, 'Please select your new department:', 'REG_SELECT_DEPT_UPDATE');
+});
 
+// 2. If chooses department (update path)
+bot.action(/REG_SELECT_DEPT_UPDATE_(.+)/, async (ctx) => {
+    const chatId = getChatId(ctx);
+    const department = ctx.match[1];
+    const reg = registrationSession[chatId];
+    if (!reg || !reg.doerId) {
+        console.log("at REG_SELECT_DEPT_UPDATE_");
+        return ctx.reply("Session expired. Please use /register again.");
+    }
+    try {
+        const doer = await Doer.findByPk(reg.doerId);
+        if (!doer) throw new Error("Doer not found.");
+
+        // Mark as approval pending for department change
+        doer.approvalStatus = 'PENDING';
+        doer.isApproved = false;
+        await doer.save();
+
+        ctx.reply(`📝 Your request to change department to *${department}* has been sent to MIS for approval. Please wait...`, {
+            parse_mode: 'Markdown'
+        });
+
+        // Send approval request to MIS
+        const misDoers = await Doer.findAll({
+            where: {
+                department: 'MIS',
+                telegramId: { [Op.not]: null },
+                isApproved: true
+            }
+        });
+
+        misDoers.forEach(mis => {
+            if (!mis.telegramId || mis.telegramId.toString().length > 12) {
+                console.warn(`Skipping MIS user with invalid telegramId:`, mis.name, mis.telegramId);
+                return;
+            }
+            bot.telegram.sendMessage(mis.telegramId,
+                `📥 *Department Change Request:*\n👤 *${doer.name}*\nOld Dept: *${doer.department}*\nNew Dept: *${department}*`,
+                {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback('✅ Approve', `REG_APPROVE_DEPT_CHANGE_${doer.id}_${department}`)],
+                        [Markup.button.callback('❌ Reject', `REG_REJECT_DEPT_CHANGE_${doer.id}`)]
+                    ])
+                }
+            );
+        });
+
+        delete registrationSession[chatId];
+    } catch (e) {
+        console.error("❌ Failed to send department change request:", e);
+        ctx.reply("⚠️ Failed to request department change. Try again.");
+    }
+});
+
+bot.action(/REG_APPROVE_DEPT_CHANGE_(\d+)_(.+)/, async (ctx) => {
+    const doerId = ctx.match[1];
+    const newDepartment = ctx.match[2];
+
+    try {
+        const doer = await Doer.findByPk(doerId);
+        if (!doer) return ctx.reply("Doer not found.");
+
+        // Guard: Prevent double-approval
+        if (doer.approvalStatus !== 'PENDING') {
+            return ctx.reply("⚠️ This request has already been processed.");
+        }
+
+        doer.department = newDepartment;
+        doer.isApproved = true;
+        doer.approvalStatus = 'APPROVED';
+        const approvedBy = `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim();
+        doer.approvedBy = approvedBy.toUpperCase();
+        await doer.save();
+
+        await bot.telegram.sendMessage(doer.telegramId, `✅ Your department change to *${newDepartment}* has been approved!`, {
+            parse_mode: 'Markdown'
+        });
+
+        ctx.reply(`👍 Department updated for *${doer.name}*.`);
+
+        // Remove buttons and update original MIS message
+        if (ctx.callbackQuery?.message?.message_id && ctx.callbackQuery?.message?.chat?.id) {
+            await ctx.editMessageReplyMarkup(); // Removes all inline keyboard buttons
+            await ctx.editMessageText(
+                `✅ Department change request for *${doer.name}* was approved by MIS.\n\nNew Department: *${newDepartment}*`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+    } catch (e) {
+        console.error("❌ Error approving department change:", e);
+        ctx.reply("⚠️ Could not approve department change.");
+    }
+});
+
+bot.action(/REG_REJECT_DEPT_CHANGE_(\d+)/, async (ctx) => {
+    const doerId = ctx.match[1];
+    const doer = await Doer.findByPk(doerId);
+    if (!doer) return ctx.reply("Doer not found.");
+
+    // Already processed? Only allow if pending
+    if (doer.approvalStatus !== 'PENDING') {
+        return ctx.reply("⚠️ This request has already been processed.");
+    }
+
+    doer.isApproved = true; // Re-enable access
+    doer.approvalStatus = 'REJECTED';
+    const approvedBy = `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim();
+    doer.approvedBy = approvedBy.toUpperCase();
+    await doer.save();
+
+    await bot.telegram.sendMessage(doer.telegramId, `❌ Your request to change department was rejected by MIS.`, { parse_mode: 'Markdown' });
+    ctx.reply(`🚫 Rejected department change for *${doer.name}*.`);
+
+    // Optional: edit the original MIS message to show status and disable buttons
+    if (ctx.callbackQuery?.message?.message_id && ctx.callbackQuery?.message?.chat?.id) {
+        await ctx.editMessageReplyMarkup(); // This removes the inline keyboard (buttons)
+        await ctx.editMessageText(`❌ Department change request for *${doer.name}* was rejected by MIS.`, { parse_mode: 'Markdown' });
+    }
+});
+
+// 4. If not in table, wants to self-add
+bot.action('REG_SELF_ADD', (ctx) => {
+    const chatId = getChatId(ctx);
+    if (!registrationSession[chatId]) {
+        console.log("at REG_SELF_ADD");
+        return ctx.reply("Session expired. Please use /register again.");
+    }
+    registrationSession[chatId].step = 'ask_name';
+    ctx.reply("Please type your full name as per records (in UPPERCASE):");
+});
+
+// 5. Capture name input from user
+bot.on('text', async (ctx, next) => {
+    const chatId = getChatId(ctx);
+    const reg = registrationSession[chatId];
+    if (!reg) return next();
+    // If at "ask_name" step (new doer self-registration)
+    if (reg.step === 'ask_name') {
+        registrationSession[chatId].pendingName = ctx.message.text.trim().toUpperCase();
+        registrationSession[chatId].step = 'ask_department_self_add';
+        // Delay a bit to avoid race condition
+        setTimeout(() => {
+            showDepartmentOptions(ctx, 'Now select your department:', 'REG_SELECT_DEPT_SELF_ADD');
+        }, 100);
+        return;
+    }
+    return next();
+});
+
+// 6. Choose department for self-added doer
+bot.action(/REG_SELECT_DEPT_SELF_ADD_(.+)/, async (ctx) => {
+    const chatId = getChatId(ctx);
+    const reg = registrationSession[chatId];
+    const department = ctx.match[1];
+
+    // LOG for debugging
+    if (!reg) {
+        console.log('Registration session missing for chat:', chatId);
+        return ctx.reply("Session expired. Please use /register again.");
+    }
+    if (reg.step !== 'ask_department_self_add') {
+        console.log('Registration session step mismatch:', reg.step, 'for chat:', chatId);
+        return ctx.reply("Session expired. Please use /register again.");
+    }
+
+    try {
+        await Doer.create({
+            name: reg.pendingName,
+            telegramId: chatId,
+            department,
+            isActive: false,
+            isApproved: false,
+            approvalStatus: 'PENDING',
+            approvedBy: null
+        });
+
+        ctx.reply(`📝 Your request to register as *${reg.pendingName}* in *${department}* department has been sent for approval. Please wait...`, { parse_mode: 'Markdown' });
+
+        // Notify MIS team
+        const misDoers = await Doer.findAll({
+            where: {
+                department: 'MIS',
+                telegramId: { [Op.not]: null },
+                isApproved: true
+            }
+        });
+
+        misDoers.forEach(mis => {
+            bot.telegram.sendMessage(mis.telegramId,
+                `📥 *New Registration Request:*\n👤 Name: *${reg.pendingName}*\n🏢 Department: *${department}*`,
+                {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback('✅ Approve', `REG_APPROVE_REQUEST_${chatId}`)],
+                        [Markup.button.callback('❌ Reject', `REG_REJECT_REQUEST_${chatId}`)]
+                    ])
+                }
+            );
+        });
+
+        delete registrationSession[chatId];
+    } catch (e) {
+        ctx.reply("Failed to create your record. It may already exist.");
+    }
+});
+
+bot.action(/REG_APPROVE_REQUEST_(\d+)/, async (ctx) => {
+    const requesterId = ctx.match[1];
+
+    const doer = await Doer.findOne({ where: { telegramId: requesterId } });
+    console.log("doer: ", doer);
+    if (!doer) return ctx.reply("Doer not found.");
+    // Guard: Prevent double approval
+    if (doer.isApproved && doer.approvalStatus === 'APPROVED') {
+        return ctx.reply("Already approved.");
+    }
+    if (doer.approvalStatus !== 'PENDING') {
+        return ctx.reply("⚠️ This request has already been processed.");
+    }
+    doer.isApproved = true;
+    doer.isActive = true;
+    doer.approvalStatus = 'APPROVED';
+    const approvedBy = `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim();
+    doer.approvedBy = approvedBy.toUpperCase();
+    await doer.save();
+
+    await bot.telegram.sendMessage(requesterId, `✅ Your registration has been approved! You can now use the bot.`, { parse_mode: 'Markdown' });
+    ctx.reply(`👍 Approved *${doer.name}*.`);
+
+    // Remove the approve/reject buttons and update the MIS message
+    if (ctx.callbackQuery?.message?.message_id && ctx.callbackQuery?.message?.chat?.id) {
+        await ctx.editMessageReplyMarkup(); // removes the buttons
+        await ctx.editMessageText(
+            `✅ Registration request for *${doer.name}* was approved by MIS.`,
+            { parse_mode: 'Markdown' }
+        );
+    }
+});
+
+bot.action(/REG_REJECT_REQUEST_(\d+)/, async (ctx) => {
+    const requesterId = ctx.match[1];
+
+    const doer = await Doer.findOne({ where: { telegramId: requesterId } });
+    if (!doer) return ctx.reply("Doer not found.");
+
+    // Guard: Prevent double rejection or processing
+    if (doer.approvalStatus !== 'PENDING') {
+        return ctx.reply("⚠️ This request has already been processed.");
+    }
+
+    await doer.destroy();
+
+    await bot.telegram.sendMessage(requesterId, `❌ Your registration request was rejected by MIS.`, { parse_mode: 'Markdown' });
+    ctx.reply(`🚫 Rejected registration for *${doer.name}*.`);
+    // Remove buttons and update the MIS message
+    if (ctx.callbackQuery?.message?.message_id && ctx.callbackQuery?.message?.chat?.id) {
+        await ctx.editMessageReplyMarkup(); // Removes all buttons
+        await ctx.editMessageText(
+            `❌ Registration request for *${doer.name}* was rejected by MIS.`,
+            { parse_mode: 'Markdown' }
+        );
+    }
+});
+
+// 3. If chooses department (new registration path)
+bot.action(/REG_SELECT_DEPT_(.+)/, async (ctx) => {
+    const chatId = getChatId(ctx);
+    const department = ctx.match[1];
+    const reg = registrationSession[chatId];
+    if (!reg || !reg.doerId) {
+        return ctx.reply("Session expired. Please use /register again.");
+    }
+    try {
+        const doer = await Doer.findByPk(reg.doerId);
+        if (!doer) throw new Error("Doer not found.");
+        doer.telegramId = chatId;
+        doer.department = department;
+        await doer.save();
+        ctx.reply(`✅ You are now registered in *${department}* department!`, { parse_mode: 'Markdown' });
+        delete registrationSession[chatId];
+    } catch (e) {
+        ctx.reply("Failed to register.");
+    }
+});
+// Cancel path
+bot.action('REG_CANCEL', (ctx) => {
+    const chatId = getChatId(ctx);
+    ctx.reply("Registration cancelled.");
+    delete registrationSession[chatId];
+});
 
 // ========== 4. Show Task Filter Buttons for Doers ==========
 // /tasks: Only available to non-boss users; displays filter buttons to view tasks by status
@@ -125,11 +499,19 @@ bot.command('tasks', async (ctx) => {
 
     if (isBoss(ctx)) return ctx.reply("❌ Bosses delegate, not do! 😎");
 
-    const telegramId = ctx.chat.id;
+    const telegramId = getChatId(ctx);
     const doer = await Doer.findOne({ where: { telegramId } });
 
     if (!doer) {
         return ctx.reply("❌ You are not registered. Use /register first.");
+    }
+
+    if (!doer.isApproved) {
+        return ctx.reply("⛔ You are not approved to use this feature yet. Please wait for MIS to approve your registration.");
+    }
+
+    if (doer.approvalStatus === 'PENDING') {
+        return ctx.reply("🕒 You already have a department change request pending approval.");
     }
 
     // Status filter buttons
@@ -149,7 +531,6 @@ bot.command('tasks', async (ctx) => {
 
 });
 
-
 // ========== 5. Action Handlers for Task Status Filters ==========
 // Handles clicks on the filter buttons to display the relevant tasks list for doer
 bot.action('TASKS_PENDING', ctx => showTasksByStatus(ctx, 'pending'));
@@ -158,13 +539,16 @@ bot.action('TASKS_REVISED', ctx => showTasksByStatus(ctx, 'revised'));
 bot.action('TASKS_CANCELED', ctx => showTasksByStatus(ctx, 'canceled'));
 
 
-
+const userSessions = {};
 // ========== 6. Mark Task as Completed Handler ==========
 // Handles the "Mark as Completed" button, updates task status, notifies EA and doer
 bot.action(/^TASK_DONE_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery(); // closes loading state on button
     const taskId = parseInt(ctx.match[1]);
-    const chatId = ctx.chat.id;
+    const chatId = getChatId(ctx);
+
+    // Clear any session for this user
+    delete userSessions[chatId];
 
     const doer = await Doer.findOne({ where: { telegramId: chatId } });
     const task = await Task.findByPk(taskId);
@@ -190,140 +574,226 @@ bot.action(/^TASK_DONE_(\d+)$/, async (ctx) => {
 
 // ========== 7. Request Task Extension: Start Session ==========
 // Handles "Request Extension" button; asks doer to type new due date in YYYY-MM-DD format
-// Tracks expected input using extensionSessions[chatId]
 
-const extensionSessions = {};
 bot.action(/^TASK_EXT_(\d+)$/, async (ctx) => {
     const chatId = getChatId(ctx);
-    delete extensionSessions[chatId];
-    await ctx.answerCbQuery();
     const taskId = parseInt(ctx.match[1]);
-    extensionSessions[ctx.chat.id] = taskId;
-
+    userSessions[chatId] = { type: 'extension', taskId };
+    await ctx.answerCbQuery();
     await ctx.reply(
-        "📅 Please enter the *new due date* for your extension in the format YYYY-MM-DD (e.g. 2024-07-15).",
+        "📅 Please enter the *new due date* for your extension in the format YYYY-MM-DD (e.g. 2024-07-15).\n\n_Type `/cancel` to stop this process._",
         { parse_mode: 'Markdown' }
     );
 
 });
-
-// ========== 8. Extension Date Input Handler ==========
-// Listens for text input; if user is in extensionSessions, validates date, saves to DB, notifies EA
-bot.on('text', async (ctx, next) => {
-    const chatId = ctx.chat.id;
-
-    // Only intercept if expecting extension date from this user
-    if (!extensionSessions[chatId]) return next();
-
-    const dateText = ctx.message.text.trim();
-    // Validate YYYY-MM-DD format
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
-        return ctx.reply("⚠️ *Invalid date format.*\nPlease type the date as YYYY-MM-DD (e.g. 2024-07-15).", { parse_mode: 'Markdown' });
-    }
-
-    const dateParts = dateText.split('-').map(Number);
-    const date = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0); // compare only date parts
-
-    // Check for invalid dates (e.g. 2024-02-30) and past dates
-    if (
-        isNaN(date.getTime()) ||
-        date.getFullYear() !== dateParts[0] ||
-        date.getMonth() !== dateParts[1] - 1 ||
-        date.getDate() !== dateParts[2] ||
-        date < today
-    ) {
-        return ctx.reply("⚠️ *Invalid or past date.*\nPlease enter a real, future date as YYYY-MM-DD (e.g. 2024-07-15).", { parse_mode: 'Markdown' });
-    }
-
-    // Now process the extension request
-    const taskId = extensionSessions[chatId];
-    const doer = await Doer.findOne({ where: { telegramId: chatId } });
-    const task = await Task.findByPk(taskId);
-
-    if (!task || !doer || task.doer !== doer.name) {
-        delete extensionSessions[chatId];
-        return ctx.reply("⚠️ Task not found or not assigned.");
-    }
-    if (task.status === 'completed') {
-        delete extensionSessions[chatId];
-        return ctx.reply("✅ Task already completed.");
-    }
-
-    // Save extension request
-    task.extensionRequestedDate = date;
-    await task.save();
-
-    await ctx.reply(
-        `📅 Extension requested for *${date.toDateString()}*. EA will review your request.`,
-        { parse_mode: 'Markdown' }
-    );
-
-    await bot.telegram.sendMessage(
-        ROLES.ea,
-        `🔁 *Extension Requested*\n\n👤 *Doer:* ${doer.name}\n🆔 *Task ID:* ${task.id}\n📝 *Task:* ${task.task}\n📅 *Requested Date:* ${date.toDateString()}`,
-        {
-            parse_mode: 'Markdown',
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('✅ Approve Extension', `EXT_APPROVE_${task.id}`)],
-                [Markup.button.callback('❌ Reject Extension', `EXT_REJECT_${task.id}`)]
-            ]).reply_markup
-        }
-    );
-    delete extensionSessions[chatId];
-});
-
-
 
 // ========== 9. Request Task Cancellation: Start Session ==========
-// Handles "Request Cancellation" button; asks doer to type reason, tracks using cancellationSessions[chatId]
-const cancellationSessions = {};
+// Handles "Request Cancellation" button; asks doer to type reason, tracks using 
 bot.action(/^TASK_CANCEL_(\d+)$/, async (ctx) => {
     const chatId = getChatId(ctx);
-    delete cancellationSessions[chatId];
-    await ctx.answerCbQuery();
     const taskId = parseInt(ctx.match[1]);
-    cancellationSessions[ctx.chat.id] = taskId;
-    await ctx.reply("✍️ Please type your *reason* for cancellation of this task:", { parse_mode: 'Markdown' });
+    userSessions[chatId] = { type: 'cancellation', taskId };
+    await ctx.answerCbQuery();
+    await ctx.reply(
+        "✍️ Please type your *reason* for cancellation of this task:\n\n_Type `/cancel` to stop this process._",
+        { parse_mode: 'Markdown' });
 });
+
+
+// ========== 8. Extension Date Input Handler ==========
+// Listens for text input; if user is in userSession(type: "extension"), validates date, saves to DB, notifies EA
 
 // ========== 10. Cancellation Reason Input Handler ==========
-// Listens for text input; if user is in cancellationSessions, saves reason, sets cancellationRequested=true, notifies EA
+// Listens for text input; if user is in userSession(type: "cancelation"), saves reason, sets cancellationRequested=true, notifies EA
 bot.on('text', async (ctx, next) => {
-    const chatId = ctx.chat.id;
-    // Only handle if in cancellation flow
-    if (!cancellationSessions[chatId]) return next();
+    const chatId = getChatId(ctx);
 
-    const reason = ctx.message.text;
-    const taskId = cancellationSessions[chatId];
-    const doer = await Doer.findOne({ where: { telegramId: chatId } });
-    const task = await Task.findByPk(taskId);
+    const session = userSessions[chatId];
+    // If no session, move to next handler
+    if (!session) return next();
 
-    if (!task || !doer || task.doer !== doer.name) {
-        delete cancellationSessions[chatId];
-        return ctx.reply("⚠️ Task not found or not assigned.");
+    const text = ctx.message.text.trim();
+
+    // Allow the user to cancel at any time
+    if (text.toLowerCase() === '/cancel') {
+        delete userSessions[chatId];
+        return ctx.reply("❌ Cancelled. You can start again any time.");
     }
 
-    task.cancellationRequested = true;
-    task.cancellationReason = reason;
-    await task.save();
+    if (session.type === 'extension') {
 
-    await ctx.reply("🚩 Cancellation request submitted. Awaiting EA review.");
 
-    await bot.telegram.sendMessage(
-        ROLES.ea,
-        `🚫 *Cancellation Requested*\n\n👤 *Doer:* ${doer.name}\n🆔 *Task ID:* ${task.id}\n📝 *Task:* ${task.task}\n✍️ *Reason:* ${reason}`,
-        {
-            parse_mode: 'Markdown',
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('✅ Approve Cancel', `CANCEL_APPROVE_${task.id}`)],
-                [Markup.button.callback('❌ Reject Cancel', `CANCEL_REJECT_${task.id}`)]
-            ]).reply_markup
+        // Validate YYYY-MM-DD format
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+            return ctx.reply("⚠️ *Invalid date format.*\nPlease type the date as YYYY-MM-DD (e.g. 2024-07-15).", { parse_mode: 'Markdown' });
         }
-    );
-    delete cancellationSessions[chatId];
+
+        const dateParts = text.split('-').map(Number);
+        const date = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0); // compare only date parts
+
+        // Check for invalid dates (e.g. 2024-02-30) and past dates
+        if (
+            isNaN(date.getTime()) ||
+            date.getFullYear() !== dateParts[0] ||
+            date.getMonth() !== dateParts[1] - 1 ||
+            date.getDate() !== dateParts[2] ||
+            date < today
+        ) {
+            return ctx.reply("⚠️ *Invalid or past date.*\nPlease enter a real, future date as YYYY-MM-DD (e.g. 2024-07-15).", { parse_mode: 'Markdown' });
+        }
+
+        // Now process the extension request
+        const taskId = session.taskId;
+        const doer = await Doer.findOne({ where: { telegramId: chatId } });
+        const task = await Task.findByPk(taskId);
+
+        if (!task || !doer || task.doer !== doer.name) {
+            delete userSessions[chatId];
+            return ctx.reply("⚠️ Task not found or not assigned.");
+        }
+        if (task.status === 'completed') {
+            delete userSessions[chatId];
+            return ctx.reply("✅ Task already completed.");
+        }
+
+        // Save extension request
+        task.extensionRequestedDate = date;
+        await task.save();
+
+        await ctx.reply(
+            `📅 Extension requested for *${date.toDateString()}*. EA will review your request.`,
+            { parse_mode: 'Markdown' }
+        );
+
+        await bot.telegram.sendMessage(
+            ROLES.ea,
+            `🔁 *Extension Requested*\n\n👤 *Doer:* ${doer.name}\n🆔 *Task ID:* ${task.id}\n📝 *Task:* ${task.task}\n📅 *Requested Date:* ${date.toDateString()}`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('✅ Approve Extension', `EXT_APPROVE_${task.id}`)],
+                    [Markup.button.callback('❌ Reject Extension', `EXT_REJECT_${task.id}`)]
+                ]).reply_markup
+            }
+        );
+        delete userSessions[chatId];
+        return;
+    }
+
+    if (session.type === 'cancellation') {
+        const reason = text;
+        const taskId = session.taskId;
+        const doer = await Doer.findOne({ where: { telegramId: chatId } });
+        const task = await Task.findByPk(taskId);
+
+        if (!task || !doer || task.doer !== doer.name) {
+            delete userSessions[chatId];
+            return ctx.reply("⚠️ Task not found or not assigned.");
+        }
+
+        task.cancellationRequested = true;
+        task.cancellationReason = reason;
+        await task.save();
+
+        await ctx.reply("🚩 Cancellation request submitted. Awaiting EA review.");
+
+
+
+
+        await bot.telegram.sendMessage(
+            ROLES.ea,
+            `🚫 *Cancellation Requested*\n\n👤 *Doer:* ${doer.name}\n🆔 *Task ID:* ${task.id}\n📝 *Task:* ${task.task}\n✍️ *Reason:* ${reason}`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('✅ Approve Cancel', `CANCEL_APPROVE_${task.id}`)],
+                    [Markup.button.callback('❌ Reject Cancel', `CANCEL_REJECT_${task.id}`)]
+                ]).reply_markup
+            }
+        );
+
+        delete userSessions[chatId];
+        return;
+
+    }
+
+
+
 });
+
+
+
+
+// command for MIS
+// bot.command('pendingregistration', async (ctx) => {
+//     const chatId = getChatId(ctx);
+
+//     // Allow only MIS department users
+//     const misUser = await Doer.findOne({
+//         where: {
+//             telegramId: chatId,
+//             department: 'MIS',
+//             isApproved: true
+//         }
+//     });
+//     if (!misUser) {
+//         return ctx.reply("❌ You are not authorized to view registration requests.");
+//     }
+
+//     // All pending requests (registration or update)
+//     const pendingRegs = await Doer.findAll({
+//         where: { approvalStatus: 'PENDING' },
+//         order: [['createdAt', 'DESC']]
+//     });
+
+//     if (!pendingRegs.length) {
+//         return ctx.reply("✅ No pending registration or department change requests found.");
+//     }
+
+//     for (const doer of pendingRegs) {
+//         let text = '';
+//         let buttons = [];
+
+//         if (doer.isActive === false) {
+//             // New registration request
+//             text = `📝 *Pending Registration:*\n👤 Name: *${doer.name}*\n🏢 Department: *${doer.department || 'N/A'}*`;
+//             buttons = [
+//                 [Markup.button.callback('✅ Approve', `REG_APPROVE_REQUEST_${doer.telegramId}`)],
+//                 [Markup.button.callback('❌ Reject', `REG_REJECT_REQUEST_${doer.telegramId}`)]
+//             ];
+//         } else if (doer.isActive === true) {
+//             // Department update request
+//             // You should have a field for requested department, e.g., doer.pendingDepartment
+//             text = `🔄 *Department Change Request:*\n👤 Name: *${doer.name}*\nOld Dept: *${doer.department || 'N/A'}*`;
+//             // if (doer.pendingDepartment) {
+//             // text += `\nNew Dept: *${doer.pendingDepartment}*`;
+//             buttons = [
+//                 [Markup.button.callback('✅ Approve', `REG_APPROVE_DEPT_CHANGE_${doer.id}_${doer.pendingDepartment}`)],
+//                 [Markup.button.callback('❌ Reject', `REG_REJECT_DEPT_CHANGE_${doer.id}`)]
+//             ];
+//             // } else {
+//             //     text += `\n\n_New department not specified. Only rejection possible._`;
+//             //     buttons = [
+//             //         [Markup.button.callback('❌ Reject', `REG_REJECT_DEPT_CHANGE_${doer.id}`)]
+//             //     ];
+//             // }
+//         }
+
+//         // Log out what you are sending
+//         console.log('Sending text:', text, 'with buttons:', buttons);
+
+//         await ctx.reply(text, {
+//             parse_mode: 'Markdown',
+//             reply_markup: Markup.inlineKeyboard(buttons)
+//         });
+
+
+//     }
+// });
+
+
 
 
 
@@ -331,7 +801,7 @@ bot.on('text', async (ctx, next) => {
 
 // For EA only if she types /heybot she gets three buttons one to check cancel requests, other is to check extension requests and last it for task preview.
 bot.command('heybot', async (ctx) => {
-    const chatId = ctx.chat.id;
+    const chatId = getChatId(ctx);
     if (![ROLES.ea, ROLES.boss].includes(chatId)) {
         return ctx.reply("❌ You are not authorized to access this menu.");
     }
@@ -359,7 +829,7 @@ bot.command('heybot', async (ctx) => {
 
 
 bot.action('EA_CANCEL_REQ', async (ctx) => {
-    const chatId = ctx.chat.id;
+    const chatId = getChatId(ctx);
 
     if (![ROLES.boss, ROLES.ea].includes(chatId)) {
         return ctx.reply("❌ You are not authorized to access cancellation requests.");
@@ -445,7 +915,7 @@ bot.action(/^CANCEL_REJECT_(\d+)$/, async (ctx) => {
 
 // First, only EA and Boss can see the extension request and they get the option for APPROVE and REJECT 
 bot.action('EA_EXT_REQ', async (ctx) => {
-    const chatId = ctx.chat.id;
+    const chatId = getChatId(ctx);
 
     if (![ROLES.boss, ROLES.ea].includes(chatId)) {
         return ctx.reply("❌ You are not authorized to access extension requests.");
@@ -453,7 +923,7 @@ bot.action('EA_EXT_REQ', async (ctx) => {
 
     const tasks = await Task.findAll({
         where: {
-            status: 'pending',
+            status: ['pending', 'revised'],
             extensionRequestedDate: { [Op.not]: null }
         },
         order: [['updatedAt', 'DESC']],
@@ -541,6 +1011,11 @@ function clearSessions(chatId) {
     delete taskSession[chatId];
     delete broadcastSessions[chatId];
     delete broadcastDraft[chatId];
+    delete userSessions[chatId];
+}
+
+function escapeMarkdown(text = '') {
+    return text.replace(/([_*`\[\]()~>#+\-=|{}.!\\])/g, '\\$1');
 }
 
 // Utility to get consistent chat ID
@@ -561,7 +1036,7 @@ const showOptions = (ctx) => {
 bot.start((ctx) => {
     const chatId = getChatId(ctx);
     clearSessions(chatId);
-    if (!isBoss(ctx)) return ctx.reply("❌ You are not authorized to use this bot.");
+    if (!isBoss(ctx)) return ctx.reply("❌ You are not allowed to do this.");
     showOptions(ctx);
 });
 
@@ -570,30 +1045,70 @@ bot.start((ctx) => {
 bot.hears(/^(hi|hello|hey)$/i, (ctx) => {
     const chatId = getChatId(ctx);
     clearSessions(chatId);
-    if (!isBoss(ctx)) return ctx.reply("❌ You are not authorized to use this bot.");
+    if (!isBoss(ctx)) return ctx.reply("❌ You are not authorized to send this msg only boss can send this msg.");
     showOptions(ctx);
 });
 
 
 
 
-// ASSIGN TASK - SELECT DOER
+// ASSIGN TASK - SELECT DEPARTMENT
+
 bot.action('ASSIGN', async (ctx) => {
     const chatId = getChatId(ctx);
-    clearSessions(chatId); // Wipe any previous session!
+    clearSessions(chatId);
 
     if (!isBoss(ctx)) return ctx.reply("❌ Only the Boss can assign tasks.");
-    taskSession[chatId] = { step: 'choose_doer' };
 
+    // Get all unique departments from active doers
     const doers = await Doer.findAll({ where: { isActive: true } });
+    const departments = [...new Set(doers.map(d => d.department))];
+
+    if (!departments.length) {
+        ctx.reply("⚠️ No departments with active doers found. Please add them.");
+        return showOptions(ctx);
+    }
+
+    const buttons = departments.map(dep => [Markup.button.callback(dep, `DEP_${dep}`)]);
+
+    taskSession[chatId] = { step: 'choose_department' };
+
+    ctx.reply('Please select a department:', Markup.inlineKeyboard(buttons));
+});
+
+
+
+bot.action(/DEP_(.+)/, async (ctx) => {
+    if (!isBoss(ctx)) return ctx.reply("❌ Only the Boss can assign tasks.");
+    const chatId = getChatId(ctx);
+
+    // Step check
+    if (!taskSession[chatId] || taskSession[chatId].step !== 'choose_department') {
+        clearSessions(chatId);
+        return ctx.reply("⚠️ Please start from the main menu to assign a task.");
+    }
+
+    const department = ctx.match[1];
+
+    // Only doers in this department
+    const doers = await Doer.findAll({ where: { isActive: true, department } });
     if (!doers.length) {
         clearSessions(chatId);
-        return ctx.reply("⚠️ No doers found in the database. Please add them.");
+        ctx.reply(`⚠️ No doers found in department: ${department}.`);
+        return showOptions(ctx);
     }
+
     const buttons = doers.map(d => [Markup.button.callback(d.name, `DOER_${d.id}`)]);
 
-    ctx.reply('Select a doer:', Markup.inlineKeyboard(buttons));
+    taskSession[chatId] = { step: 'choose_doer', department };
+
+    ctx.reply(`Select a doer from *${escapeMarkdown(department)}*:`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard(buttons)
+    });
 });
+
+
 
 
 // HANDLE DOER SELECTED
@@ -616,6 +1131,7 @@ bot.action(/DOER_(\d+)/, async (ctx) => {
     if (!doer) return ctx.reply("❌ Doer not found.");
 
     taskSession[chatId] = {
+        ...taskSession[chatId],
         step: 'waiting_task', // <--- Next step is typing the task
         doerName: doer.name,
         doerId: doer.id,
@@ -628,8 +1144,10 @@ bot.action(/DOER_(\d+)/, async (ctx) => {
 
 // HANDLE TEXT INPUT (TASK )
 bot.on('text', async (ctx, next) => {
-    if (!isBoss(ctx)) return ctx.reply("❌ Only the Boss can perform this action.");
-
+    if (!isBoss(ctx)) {
+        ctx.reply("❌ Only the Boss can perform this action.");
+        return showDoerHelp(ctx);
+    }
     const chatId = getChatId(ctx);
     const session = taskSession[chatId];
 
@@ -727,18 +1245,33 @@ bot.action('URGENT', (ctx) => {
 
 // SHOW PREVIEW
 function showReviewOptions(ctx, session) {
-    ctx.reply(`📝 *Task Preview*:
-👤 Doer: ${session.doerName}
-📄 Task: ${session.task}
-⏱️ Urgency: ${session.urgency}
-📅 Due: ${session.dueDate ? session.dueDate.toDateString() : 'ASAP'}`, {
+    const message = `📝 *Task Assignment Summary*
+
+───────────────
+👤 *Assigned To:*   ${session.doerName}
+
+🧾 *Task Description:* 
+${session.task}
+
+⚡ *Urgency Level:* ${session.urgency}
+
+📅 *Deadline:*  ${session.dueDate ? session.dueDate.toDateString() : 'ASAP'}
+───────────────
+
+Please review the task details carefully before proceeding.`;
+
+    ctx.reply(message, {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
             [Markup.button.callback('✏️ Edit Task', 'EDIT')],
-            [Markup.button.callback('✅ Send Task', 'SEND')]
+            [Markup.button.callback('✅ Confirm & Send', 'SEND')]
         ])
     });
 }
+
+
+
+
 
 // EDIT TASK
 bot.action('EDIT', (ctx) => {
@@ -754,7 +1287,10 @@ bot.action('EDIT', (ctx) => {
     }
     delete session.task;
     session.step = 'waiting_task';
-    ctx.reply('Please retype the task:');
+    ctx.reply(
+        `Editing task for: ${escapeMarkdown(session.doerName)}\nPlease retype the task:`,
+        { parse_mode: 'Markdown' }
+    );
 });
 
 
@@ -777,7 +1313,8 @@ bot.action('SEND', async (ctx) => {
         task: session.task,
         doer: session.doerName,
         urgency: session.urgency,
-        dueDate: session.dueDate
+        dueDate: session.dueDate,
+        department: session.department
     });
 
     ctx.reply(`✅ Task sent to ${session.doerName} successfully!`);
@@ -788,16 +1325,27 @@ bot.action('SEND', async (ctx) => {
             const taskId = newTask.id;
             await bot.telegram.sendMessage(
                 session.doerTelegramId,
-                `📥 *New Task Assigned*\n\n📄 ${session.task}\n⏱️ ${session.urgency}\n📅 ${session.dueDate ? session.dueDate.toDateString() : 'ASAP'}`,
+                `📥 *You Have a New Task Assigned!*
+
+━━━━━━━━━━━━━━━━━━
+🧾 *Task:*  
+${session.task}
+
+⚡ *Urgency:* ${session.urgency}
+
+📅 *Due Date:* ${session.dueDate ? session.dueDate.toDateString() : 'ASAP'}
+━━━━━━━━━━━━━━━━━━
+
+Please take appropriate action below if required.`,
                 {
                     parse_mode: 'Markdown',
                     reply_markup: {
                         inline_keyboard: [
                             [
-                                { text: '🗓️ Request Extension', callback_data: `TASK_EXT_${taskId}` }
+                                { text: '🗓️ Request Extension', callback_data: `TASK_EXT_${newTask.id}` },
                             ],
                             [
-                                { text: '🚫 Request Cancellation', callback_data: `TASK_CANCEL_${taskId}` }
+                                { text: '🚫 Request Cancellation', callback_data: `TASK_CANCEL_${newTask.id}` }
                             ]
                         ]
                     }
@@ -824,8 +1372,62 @@ bot.action('SEND', async (ctx) => {
     }
 
 
-    delete taskSession[chatId];
+    // Ask if boss wants to add another task for the same doer
+    session.step = 'add_another_task';
+    ctx.reply(
+        `➕ Do you want to assign another task to ${escapeMarkdown(session.doerName)}?`,
+        {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('Yes', 'ADD_ANOTHER_YES')],
+                [Markup.button.callback('No', 'ADD_ANOTHER_NO')]
+            ])
+        }
+    );
 });
+
+
+
+bot.action('ADD_ANOTHER_YES', (ctx) => {
+    const chatId = getChatId(ctx);
+    const session = taskSession[chatId];
+
+    if (!session || session.step !== 'add_another_task') {
+        clearSessions(chatId);
+        return ctx.reply("⚠️ No ongoing task assignment. Please start from the main menu.");
+    }
+
+    // Start a new task assignment for the SAME doer
+    delete session.task;
+    delete session.urgency;
+    delete session.dueDate;
+    session.step = 'waiting_task';
+
+    ctx.reply(
+        `Great! Type the next task for ${escapeMarkdown(session.doerName)}:`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+bot.action('ADD_ANOTHER_NO', (ctx) => {
+    const chatId = getChatId(ctx);
+    const session = taskSession[chatId];
+
+    if (!session || session.step !== 'add_another_task') {
+        clearSessions(chatId);
+        return ctx.reply("⚠️ No ongoing task assignment. Please start from the main menu.");
+    }
+
+    clearSessions(chatId);
+    ctx.reply("✅ Done! All tasks assigned. Returning to main menu.");
+    showOptions(ctx);
+});
+
+
+
+
+
+
 
 
 
@@ -859,14 +1461,23 @@ bot.action('STATUS_PENDING', async (ctx) => {
 
     const tasks = await Task.findAll({
         where: { status: 'pending' },
-        order: [['createdAt', 'DESC']],
+        order: [
+            [sequelize.literal(`CASE WHEN urgency = 'urgent' THEN 0 ELSE 1 END`), 'ASC'],
+            ['createdAt', 'DESC']
+        ],
         limit: 10
     });
 
     if (!tasks.length) return ctx.reply("✅ No pending tasks.");
 
-    const msg = tasks.map(t => `👤 ${t.doer}\n📄 ${t.task}\n📅 ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}`).join('\n\n');
-    ctx.reply(`🟡 *Pending Tasks:*\n\n${msg}`, { parse_mode: 'Markdown' });
+    const msg = tasks.map((t, i) =>
+        `📝 *Task ${i + 1}*\n━━━━━━━━━━━━━━\n` +
+        `👤 *Assigned To:* ${t.doer}\n` +
+        `📄 *Description:* ${t.task}\n` +
+        `📅 *Due Date:* ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}\n`
+    ).join('\n\n');
+
+    ctx.reply(`🟡 *Pending Tasks (Latest 10)*\n\n${msg}`, { parse_mode: 'Markdown' });
 });
 
 
@@ -887,10 +1498,18 @@ bot.action('STATUS_COMPLETED', async (ctx) => {
 
     if (!tasks.length) return ctx.reply("📭 No completed tasks.");
 
-    const msg = tasks.map(t => `👤 ${t.doer}\n📄 ${t.task}\n📅 ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}`).join('\n\n');
+    const msg = tasks.map((t, i) => {
+        return (
+            `✅ *Task ${i + 1}*\n━━━━━━━━━━━━━━\n` +
+            `👤 *Completed By:* ${t.doer}\n` +
+            `📄 *Task:* ${t.task}\n` +
+            `📅 *Completed On:* ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}\n`
+        );
+    }).join('\n\n');
 
-    console.log("Status_completed: msg: ", msg);
-    ctx.reply(`🟢 *Completed Tasks:*\n\n${msg}`, { parse_mode: 'Markdown' });
+    ctx.reply(`🟢 *Recently Completed Tasks (Top 10)*\n\n${msg}`, {
+        parse_mode: 'Markdown'
+    });
 });
 
 // Revised Tasks (due date extended)
@@ -906,17 +1525,27 @@ bot.action('STATUS_REVISED', async (ctx) => {
         where: {
             status: 'revised'  // 👈 direct status match
         },
-        order: [['updatedAt', 'DESC']],
+        order: [
+            [sequelize.literal(`CASE WHEN urgency = 'urgent' THEN 0 ELSE 1 END`), 'ASC'],
+            ['updatedAt', 'DESC']
+        ],
         limit: 10
     });
 
     if (!tasks.length) return ctx.reply("🔁 No revised tasks found.");
 
-    const msg = tasks.map(t =>
-        `👤 ${t.doer}\n📄 ${t.task}\n📅 New Due: ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}`
-    ).join('\n\n');
+    const msg = tasks.map((t, i) => {
+        return (
+            `🔁 *Task ${i + 1}*\n━━━━━━━━━━━━━━\n` +
+            `👤 *Assigned To:* ${t.doer}\n` +
+            `📄 *Task:* ${t.task}\n` +
+            `📅 *Revised Due Date:* ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}\n`
+        );
+    }).join('\n\n');
 
-    ctx.reply(`🔁 *Revised Tasks:*\n\n${msg}`, { parse_mode: 'Markdown' });
+    ctx.reply(`🔁 *Revised Tasks (Top 10)*\n\n${msg}`, {
+        parse_mode: 'Markdown'
+    });
 });
 
 
@@ -929,17 +1558,27 @@ bot.action('STATUS_CANCELLED', async (ctx) => {
 
     const tasks = await Task.findAll({
         where: { status: 'canceled' },  // direct match
-        order: [['updatedAt', 'DESC']],
+        order: [
+            [sequelize.literal(`CASE WHEN urgency = 'urgent' THEN 0 ELSE 1 END`), 'ASC'],
+            ['updatedAt', 'DESC']
+        ],
         limit: 10
     });
 
     if (!tasks.length) return ctx.reply("❌ No cancelled tasks found.");
 
-    const msg = tasks.map(t =>
-        `👤 *Doer:* ${t.doer}\n📄 *Task:* ${t.task}\n📅 *Due Date:* ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}`
-    ).join('\n\n');
+    const msg = tasks.map((t, i) => {
+        return (
+            `❌ *Task ${i + 1}*\n━━━━━━━━━━━━━━\n` +
+            `👤 *Doer:* ${t.doer}\n` +
+            `📄 *Task:* ${t.task}\n` +
+            `📅 *Due Date:* ${t.dueDate ? new Date(t.dueDate).toDateString() : 'ASAP'}`
+        );
+    }).join('\n\n');
 
-    ctx.reply(`❌ *Cancelled Tasks:*\n\n${msg}`, { parse_mode: 'Markdown' });
+    ctx.reply(`❌ *Cancelled Tasks (Top 10)*\n\n${msg}`, {
+        parse_mode: 'Markdown'
+    });
 });
 
 
@@ -1020,6 +1659,57 @@ bot.action('BROADCAST_CANCEL', async (ctx) => {
 
 
 
+
+bot.on('text', (ctx) => {
+    const chatId = getChatId(ctx);
+
+    // Check if it's already handled by session or expected flow
+    if (ctx.session?.step || registrationSession[chatId]) {
+        return; // Let other flows continue
+    }
+
+    if (isBoss(ctx)) {
+        showBossHelp(ctx);
+    } else {
+        showDoerHelp(ctx);
+    }
+});
+
+
+function showDoerHelp(ctx) {
+    ctx.reply(
+        `👤 *Available Commands for You:*\n` + "\n" +
+        `/register - Register yourself, update department or change department\n` + "\n" +
+        `/tasks - View your tasks\n` + "\n" +
+        `/pendingregistration - only MIS can view the pending registrations\n` + "\n" +
+        `/heybot - for EA to follow up\n` + "\n" +
+        `/help - Show this menu`,
+        { parse_mode: 'Markdown' }
+    );
+}
+
+function showBossHelp(ctx) {
+    ctx.reply(
+        `👑 *Boss Commands:*\n` + "\n" +
+        `/start - Open main menu\n` + "\n" +
+        `/heybot - Access EA control panel\n` + "\n" +
+        `/help - Show this menu`,
+        { parse_mode: 'Markdown' }
+    );
+}
+
+
+bot.command('help', (ctx) => {
+    if (isBoss(ctx)) {
+        showBossHelp(ctx);
+    } else {
+        showDoerHelp(ctx);
+    }
+});
+
+
+
+
 module.exports = bot;
 
 
@@ -1060,4 +1750,5 @@ module.exports = bot;
 // bot.use(stage.middleware());
 
 // bot.command('wizard', (ctx) => ctx.scene.enter('my-wizard'));
+
 
