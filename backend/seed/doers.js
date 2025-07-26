@@ -5,36 +5,37 @@ const seedDoers = async () => {
   try {
     await sequelize.sync();
 
-    const names = [
-      "ANITA DORJEE",
-      "ANISHA LYNGDOH",
-      "ALVIN KHARBAMON",
-      "AIDAHUNLIN NALLE JYRWA",
-      "BANROILANG",
-      "BANSHANLANG",
-      "BANTYNSHAIN LYNGDOH",
-      "BHAGYASHREE SINHA",
-      "DORIS",
-      "EVAMEDALYNE LANGSTANG",
-      "FANNY",
-      "HIMANI",
-      "JENNIFER JYRWA",
-      "JOEY",
-      "KIRAN DAS",
-      "MONICA LYNGDOH",
-      "MOHAMMED SERAJ ANSARI",
-      "MEWANKHRAW MAJAW",
-      "RAJESH KUMAR THAKUR",
-      "SANJAY THAPA",
-      "SAFIRALIN",
-      "SALEEM",
-      "ROSHAN",
-      "SICOVONTRITCHZ D THANKHIEW",
-      "TITU BHOWMICK",
-      "WANHUNLANG KHARSATI",
-      "YUMNAM JACKSON SINGH",
-      "JUDHVEER"
-    ];
+//         const names = [
+//   "ANITA DORJEE",
+//   "ANISHA LYNGDOH",
+//   "ALVIN KHARBAMON",
+//   "AIDAHUNLIN NALLE JYRWA",
+//   "BANROILANG",
+//   "BANSHANLANG",
+//   "BANTYNSHAIN LYNGDOH",
+//   "BHAGYASHREE SINHA",
+//   "DORIS",
+//   "EVAMEDALYNE LANGSTANG",
+//   "FANNY",
+//   "HIMANI",
+//   "JENNIFER JYRWA",
+//   "JOEY",
+//   "KIRAN DAS",
+//   "MONICA LYNGDOH",
+//   "MOHAMMED SERAJ ANSARI",
+//   "MEWANKHRAW MAJAW",
+//   "RAJESH KUMAR THAKUR",
+//   "SANJAY THAPA",
+//   "SAFIRALIN",
+//   "ROSHAN",
+//   "SICOVONTRITCHZ D THANGKHIEW",
+//   "TITU BHOWMICK",
+//   "WANHUNLANG KHARSATI",
+//   "YUMNAM JACKSON SINGH",
+//   "SHANLANG",
+//   "IARAP"
+// ];
+    const names = ["EWAN HA I SHYLLA"];
 
     const doers = names.map(name => ({
       name,
