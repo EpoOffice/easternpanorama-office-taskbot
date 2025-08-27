@@ -1681,7 +1681,7 @@ function showDoerHelp(ctx) {
         `👤 *Available Commands for You:*\n` + "\n" +
         `/register - Register yourself, update department or change department\n` + "\n" +
         `/tasks - View your tasks\n` + "\n" +
-        `/pendingregistration - only MIS can view the pending registrations\n` + "\n" +
+        // `/pendingregistration - only MIS can view the pending registrations\n` + "\n" +
         `/heybot - for EA to follow up\n` + "\n" +
         `/help - Show this menu`,
         { parse_mode: 'Markdown' }

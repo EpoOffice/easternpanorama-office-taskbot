@@ -16,17 +16,15 @@ const nameToDepartment = {
   "TITU BHOWMICK": "Designer",
   "WANHUNLANG KHARSATI": "Designer",
   "MONICA LYNGDOH": "EA",
-  "MOHAMMED SERAJ ANSARI": "EA",
+  "MOHAMMED SERAJ ANSARI": "Process Coordinator",
   "ROSHAN": "EA",
   "YUMNAM JACKSON SINGH": "Foundation",
-  "JENNIFER JYRWA": "HR",
   "ANITA DORJEE": "MIS",
   "EWAN HA I SHYLLA": "Office Assistant",
   "BHAGYASHREE SINHA": "Process Coordinator",
   "HIMANI": "Process Coordinator",
   "SAFIRALIN": "Receptionist",
   "BANTYNSHAIN LYNGDOH": "Sales dept",
-  "SHANLANG": "Tender Executive"
 };
 
 const seedDepartments = async () => {
